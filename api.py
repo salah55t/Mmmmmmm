@@ -1,79 +1,145 @@
 # -*- coding: utf-8 -*-
-from fastapi import FastAPI, HTTPException, Query as FastAPIQuery
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from tradingview_screener import Query
 import pandas as pd
 import numpy as np
+import requests
 from typing import List, Optional
 import uvicorn
 import os
 
 app = FastAPI(
-    title="TradingView Flexible Proxy API",
-    description="جسر بيانات يدعم GET و POST معاً لحل مشكلة 404 على ريندر"
+    title="Binance Local Analytics Proxy API",
+    description="جسر تحليلي متطور يتصل مباشرة بـ Binance API ويحسب المؤشرات محلياً"
 )
 
+# نموذج استقبال البيانات لضمان التوافق والأمان
 class TickerRequest(BaseModel):
     tickers: List[str]
+    api_key: Optional[str] = None
+    api_secret: Optional[str] = None
 
-def chunk_list(lst, n):
-    """تقسيم القائمة الكبيرة إلى دفعات صغيرة"""
-    for i in range(0, len(lst), n):
-        yield lst[i:i + n]
+# --- الدوال الرياضية لحساب المؤشرات فريش داخل السيرفر ---
+def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """حساب مؤشر القوة النسبية RSI بدقة Wilder الرياضية"""
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).ewm(alpha=1/period, adjust=False).mean()
+    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/period, adjust=False).mean()
+    rs = gain / (loss + 1e-9)
+    return 100 - (100 / (1 + rs))
 
-def execute_scan(tickers: List[str]) -> List[dict]:
-    """الدالة الأساسية لمعالجة وجلب البيانات الفنية"""
-    print(f"⚙️ جاري معالجة طلب فحص لـ {len(tickers)} عملة...")
-    combined_records = []
-    batches = list(chunk_list(tickers, 30))
+def calculate_adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    """حساب مؤشر قوة الاتجاه ADX بدقة فنية كاملة"""
+    plus_dm = high.diff()
+    minus_dm = low.diff()
+    plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
+    minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0.0)
     
-    for idx, batch in enumerate(batches):
-        try:
-            q = Query().select(
-                'close', 'change', 'volume', 'RSI', 'ADX', 
-                'EMA9', 'EMA21', 'BB.lower', 'BB.upper'
-            )
-            q.set_tickers(*batch)
-            _, data = q.get_scanner_data()
-            
-            if data is not None and not data.empty:
-                cleaned_data = data.replace([np.inf, -np.inf], np.nan)
-                cleaned_data = cleaned_data.astype(object).where(pd.notnull(cleaned_data), None)
-                records = cleaned_data.to_dict(orient="records")
-                combined_records.extend(records)
-                print(f"✅ تم بنجاح جلب الدفعة {idx+1}/{len(batches)}")
-        except Exception as e:
-            print(f"⚠️ خطأ في جلب الدفعة {idx+1}: {e}")
-            continue
-            
-    return combined_records
+    tr1 = high - low
+    tr2 = abs(high - close.shift(1))
+    tr3 = abs(low - close.shift(1))
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    
+    atr = tr.ewm(alpha=1/period, adjust=False).mean()
+    plus_di = 100 * (pd.Series(plus_dm).ewm(alpha=1/period, adjust=False).mean() / (atr + 1e-9))
+    minus_di = 100 * (pd.Series(minus_dm).ewm(alpha=1/period, adjust=False).mean() / (atr + 1e-9))
+    
+    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
+    return dx.ewm(alpha=1/period, adjust=False).mean()
+
+def fetch_binance_klines(symbol: str, interval: str = "1h", limit: int = 100, api_key: Optional[str] = None) -> pd.DataFrame:
+    """جلب بيانات الشموع مباشرة من خوادم باينانس الرسمية"""
+    url = "https://api.binance.com/api/v3/klines"
+    headers = {}
+    if api_key:
+        headers["X-MBX-APIKEY"] = api_key
+        
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "limit": limit
+    }
+    
+    response = requests.get(url, params=params, headers=headers, timeout=10)
+    if response.status_code != 200:
+        raise Exception(f"Binance API returned status {response.status_code}")
+        
+    data = response.json()
+    # تحويل مصفوفة باينانس إلى DataFrame
+    df = pd.DataFrame(data, columns=[
+        'OpenTime', 'Open', 'High', 'Low', 'Close', 'Volume',
+        'CloseTime', 'QuoteAssetVolume', 'NumberOfTrades',
+        'TakerBuyBaseAssetVolume', 'TakerBuyQuoteAssetVolume', 'Ignore'
+    ])
+    
+    # تحويل أنواع البيانات إلى أرقام عشرية للحساب الفني
+    for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+        df[col] = df[col].astype(float)
+        
+    return df
 
 @app.get("/")
 def health_check():
-    return {"status": "online", "message": "Proxy is active and healthy!"}
+    return {"status": "online", "message": "Binance Analytics Proxy is fully active!"}
 
-# --- دعم مسارات الـ POST (مع وبدون شرطة مائلة) ---
 @app.post("/scan")
 @app.post("/scan/")
-def scan_tickers_post(payload: TickerRequest):
-    print("📥 تم استقبال طلب POST على مسار /scan")
-    results = execute_scan(payload.tickers)
-    if not results:
-        raise HTTPException(status_code=404, detail="No data could be fetched")
-    return {"success": True, "data": results}
-
-# --- دعم مسارات الـ GET كبديل احتياطي أوتوماتيكي ممتاز ---
-@app.get("/scan")
-@app.get("/scan/")
-def scan_tickers_get(tickers: Optional[List[str]] = FastAPIQuery(None)):
-    print("📥 تم استقبال طلب GET على مسار /scan")
-    if not tickers:
-        # عملات افتراضية في حال طلب فحص فارغ
-        tickers = ["BINANCE:BTCUSDT", "BINANCE:ETHUSDT", "BINANCE:SOLUSDT"]
-    results = execute_scan(tickers)
-    if not results:
-        raise HTTPException(status_code=404, detail="No data could be fetched")
-    return {"success": True, "data": results}
+def scan_tickers(payload: TickerRequest):
+    print(f"⚙️ جاري معالجة فحص لـ {len(payload.tickers)} عملة مباشرة عبر Binance API...")
+    combined_records = []
+    
+    for t in payload.tickers:
+        try:
+            # استخراج الرمز الصافي المتوافق مع باينانس (مثال: BTCUSDT)
+            symbol_clean = t.replace("BINANCE:", "").replace(":", "")
+            
+            # جلب البيانات التاريخية من باينانس
+            df = fetch_binance_klines(symbol_clean, interval="1h", limit=100, api_key=payload.api_key)
+            if df.empty or len(df) < 30:
+                continue
+                
+            # حساب المؤشرات محلياً بدقة متناهية
+            df['EMA9'] = df['Close'].ewm(span=9, adjust=False).mean()
+            df['EMA21'] = df['Close'].ewm(span=21, adjust=False).mean()
+            
+            # حساب حزم بولينجر
+            sma20 = df['Close'].rolling(window=20).mean()
+            std20 = df['Close'].rolling(window=20).std()
+            df['BB_lower'] = sma20 - (2 * std20)
+            df['BB_upper'] = sma20 + (2 * std20)
+            
+            # حساب RSI و ADX
+            df['RSI'] = calculate_rsi(df['Close'], 14)
+            df['ADX'] = calculate_adx(df['High'], df['Low'], df['Close'], 14)
+            
+            # استخراج الشمعة الأخيرة والسابقة
+            last_row = df.iloc[-1]
+            close_price = float(last_row['Close'])
+            open_price = float(last_row['Open'])
+            change_pct = ((close_price - open_price) / open_price) * 100
+            
+            record = {
+                "ticker": t,
+                "close": close_price,
+                "change": change_pct,
+                "volume": float(last_row['Volume']) if pd.notna(last_row['Volume']) else 0.0,
+                "RSI": float(last_row['RSI']) if pd.notna(last_row['RSI']) else None,
+                "ADX": float(last_row['ADX']) if pd.notna(last_row['ADX']) else None,
+                "EMA9": float(last_row['EMA9']) if pd.notna(last_row['EMA9']) else None,
+                "EMA21": float(last_row['EMA21']) if pd.notna(last_row['EMA21']) else None,
+                "BB.lower": float(last_row['BB_lower']) if pd.notna(last_row['BB_lower']) else None,
+                "BB.upper": float(last_row['BB_upper']) if pd.notna(last_row['BB_upper']) else None
+            }
+            combined_records.append(record)
+        except Exception as e:
+            # تخطي أي عملة تفشل في الجلب لمنع توقف الرادار
+            print(f"⚠️ فشل تحليل {t}: {e}")
+            continue
+            
+    if not combined_records:
+        raise HTTPException(status_code=404, detail="No data could be fetched from Binance API")
+        
+    return {"success": True, "data": combined_records}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
