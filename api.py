@@ -1,40 +1,21 @@
-# -*- coding: utf-8 -*-
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from binance import AsyncClient  # الاستيراد الرسمي لمكتبة باينانس غير المتزامنة
-import pandas as pd
-import numpy as np
-import asyncio
-from typing import List, Optional
-import uvicorn
+from fastapi import FastAPI
+from binance import AsyncClient
 import os
 
-app = FastAPI(
-    title="Binance Official Library Proxy API",
-    description="جسر تحليلي خارق السرعة يتصل بباينانس عبر مكتبة python-binance الرسمية ويعالج البيانات محلياً"
-)
+app = FastAPI()
 
-# قراءة مفاتيح باينانس الرسمية والمشفرة من متغيرات بيئة Render
-BINANCE_API_KEY = os.environ.get("BINANCE_API_KEY", "")
-BINANCE_API_SECRET = os.environ.get("BINANCE_API_SECRET", "")
+# استخدام مكتبة باينانس الرسمية
+async def get_binance_data(symbol):
+    client = await AsyncClient.create(os.environ.get("BINANCE_API_KEY"), os.environ.get("BINANCE_API_SECRET"))
+    klines = await client.get_klines(symbol=symbol, interval='1h', limit=100)
+    await client.close_connection()
+    return klines
 
-class TickerRequest(BaseModel):
-    tickers: List[str]
-
-# --- الحسابات الرياضية للمؤشرات الفنية داخل السيرفر ---
-def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    """حساب مؤشر القوة النسبية RSI بدقة Wilder"""
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).ewm(alpha=1/period, adjust=False).mean()
-    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/period, adjust=False).mean()
-    rs = gain / (loss + 1e-9)
-    return 100 - (100 / (1 + rs))
-
-def calculate_adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-    """حساب مؤشر الاتجاه ADX بدقة فنية تامة"""
-    plus_dm = high.diff()
-    minus_dm = low.diff()
-    plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
+@app.get("/fetch_data/{symbol}")
+async def fetch_data(symbol: str):
+    # مجرد وسيلة نقل: تجلب البيانات وترسلها فوراً للرادار
+    data = await get_binance_data(symbol)
+    return {"symbol": symbol, "data": data}    plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
     minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0.0)
     
     tr1 = high - low
