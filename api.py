@@ -1,48 +1,34 @@
 # -*- coding: utf-8 -*-
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query as FastAPIQuery
 from pydantic import BaseModel
 from tradingview_screener import Query
 import pandas as pd
 import numpy as np
-from typing import List
+from typing import List, Optional
 import uvicorn
 import os
 
-# تهيئة تطبيق FastAPI
 app = FastAPI(
-    title="TradingView Secure Proxy API",
-    description="جسر بيانات مطور يعتمد على معالجة الدفعات وتصفية البيانات الفارغة لتجنب خطأ 500"
+    title="TradingView Flexible Proxy API",
+    description="جسر بيانات يدعم GET و POST معاً لحل مشكلة 404 على ريندر"
 )
 
-# نموذج استقبال البيانات لضمان صحة المدخلات عبر طلبات POST
 class TickerRequest(BaseModel):
     tickers: List[str]
 
 def chunk_list(lst, n):
-    """تقسيم القائمة الكبيرة من العملات إلى دفعات صغيرة الحجم لتجنب الضغط والمهلة الزمنية"""
+    """تقسيم القائمة الكبيرة إلى دفعات صغيرة"""
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
-@app.get("/")
-def health_check():
-    """نقطة فحص السلامة للتأكد من أن الخادم يعمل على ريندر"""
-    return {"status": "online", "message": "Secure Proxy is fully active and stable!"}
-
-@app.post("/scan")
-def scan_tickers(payload: TickerRequest):
-    """نقطة الاتصال الرئيسية لجلب ومعالجة مؤشرات التداول"""
-    tickers = payload.tickers
-    if not tickers:
-        raise HTTPException(status_code=400, detail="Tickers list cannot be empty")
-    
+def execute_scan(tickers: List[str]) -> List[dict]:
+    """الدالة الأساسية لمعالجة وجلب البيانات الفنية"""
+    print(f"⚙️ جاري معالجة طلب فحص لـ {len(tickers)} عملة...")
     combined_records = []
-    
-    # تقسيم العملات إلى دفعات (30 عملة لكل دفعة) لمعالجة مستقرة وسريعة
     batches = list(chunk_list(tickers, 30))
     
-    for batch in batches:
+    for idx, batch in enumerate(batches):
         try:
-            # صياغة الاستعلام لمكتبة TradingView مع تحديد المؤشرات بدقة عالية
             q = Query().select(
                 'close', 'change', 'volume', 'RSI', 'ADX', 
                 'EMA9', 'EMA21', 'BB.lower', 'BB.upper'
@@ -51,25 +37,44 @@ def scan_tickers(payload: TickerRequest):
             _, data = q.get_scanner_data()
             
             if data is not None and not data.empty:
-                # استبدال قيم المالانهاية (inf) بقيم NaN العادية لمنع الانهيار
                 cleaned_data = data.replace([np.inf, -np.inf], np.nan)
-                
-                # استبدال جميع قيم NaN بكائنات None ليتم تحويلها إلى null القياسية في JSON
                 cleaned_data = cleaned_data.astype(object).where(pd.notnull(cleaned_data), None)
-                
-                # تحويل الجدول إلى قائمة من القواميس وإضافتها للنتائج المدمجة
                 records = cleaned_data.to_dict(orient="records")
                 combined_records.extend(records)
-        except Exception:
-            # تخطي أي دفعة تحتوي على أخطاء دون التسبب في إيقاف الفحص بالكامل
+                print(f"✅ تم بنجاح جلب الدفعة {idx+1}/{len(batches)}")
+        except Exception as e:
+            print(f"⚠️ خطأ في جلب الدفعة {idx+1}: {e}")
             continue
             
-    if not combined_records:
-        raise HTTPException(status_code=404, detail="Failed to fetch active data for all batches")
-        
-    return {"success": True, "data": combined_records}
+    return combined_records
+
+@app.get("/")
+def health_check():
+    return {"status": "online", "message": "Proxy is active and healthy!"}
+
+# --- دعم مسارات الـ POST (مع وبدون شرطة مائلة) ---
+@app.post("/scan")
+@app.post("/scan/")
+def scan_tickers_post(payload: TickerRequest):
+    print("📥 تم استقبال طلب POST على مسار /scan")
+    results = execute_scan(payload.tickers)
+    if not results:
+        raise HTTPException(status_code=404, detail="No data could be fetched")
+    return {"success": True, "data": results}
+
+# --- دعم مسارات الـ GET كبديل احتياطي أوتوماتيكي ممتاز ---
+@app.get("/scan")
+@app.get("/scan/")
+def scan_tickers_get(tickers: Optional[List[str]] = FastAPIQuery(None)):
+    print("📥 تم استقبال طلب GET على مسار /scan")
+    if not tickers:
+        # عملات افتراضية في حال طلب فحص فارغ
+        tickers = ["BINANCE:BTCUSDT", "BINANCE:ETHUSDT", "BINANCE:SOLUSDT"]
+    results = execute_scan(tickers)
+    if not results:
+        raise HTTPException(status_code=404, detail="No data could be fetched")
+    return {"success": True, "data": results}
 
 if __name__ == "__main__":
-    # تشغيل الخادم والارتباط بالمنفذ الذي تخصصه منصة الاستضافة تلقائياً
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
