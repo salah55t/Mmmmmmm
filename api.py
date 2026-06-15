@@ -1,52 +1,68 @@
 # -*- coding: utf-8 -*-
-from fastapi import FastAPI, HTTPException, Query as FastAPIQuery
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 from tradingview_screener import Query
-import uvicorn
+import pandas as pd
+import numpy as np
 from typing import List
+import uvicorn
+import os
 
-# إنشاء تطبيق FastAPI
 app = FastAPI(
-    title="TradingView API Proxy for Crypto Radar",
-    description="جسر بيانات وسيط لجلب مؤشرات التداول من TradingView دون حظر"
+    title="TradingView Secure Proxy API",
+    description="جسر بيانات مطور يعتمد على معالجة الدفعات وتصفية البيانات الفارغة لتجنب خطأ 500"
 )
 
-@app.get("/")
-def read_root():
-    return {"status": "online", "message": "Crypto Radar Proxy API is running smoothly!"}
+# نموذج استقبال البيانات عبر طلب POST لمنع مشاكل طول الرابط
+class TickerRequest(BaseModel):
+    tickers: List[str]
 
-@app.get("/scan")
-def scan_tickers(tickers: List[str] = FastAPIQuery(None)):
-    """
-    نقطة اتصال تقوم باستقبال قائمة العملات وجلب مؤشراتها فورا من TradingView
-    """
+def chunk_list(lst, n):
+    """تقسيم القائمة الكبيرة إلى دفعات صغيرة الحجم"""
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
+@app.get("/")
+def health_check():
+    return {"status": "online", "message": "Secure Proxy is fully active and stable!"}
+
+@app.post("/scan")
+def scan_tickers(payload: TickerRequest):
+    tickers = payload.tickers
     if not tickers:
-        # قائمة افتراضية في حال عدم إرسال عملات محددة
-        tickers = [
-            "BINANCE:BTCUSDT", "BINANCE:ETHUSDT", "BINANCE:SOLUSDT", 
-            "BINANCE:BNBUSDT", "BINANCE:ADAUSDT", "BINANCE:AVAXUSDT"
-        ]
+        raise HTTPException(status_code=400, detail="Tickers list cannot be empty")
     
-    try:
-        # إعداد طلب المؤشرات الفنية الأساسية من TradingView
-        q = Query().select(
-            'close', 'change', 'volume', 'RSI', 'ADX', 
-            'EMA9', 'EMA21', 'BB.lower', 'BB.upper'
-        )
-        q.set_tickers(*tickers)
-        _, data = q.get_scanner_data()
-        
-        if data is None or data.empty:
-            raise HTTPException(status_code=404, detail="No data received from TradingView")
+    combined_records = []
+    
+    # تقسيم العملات إلى دفعات (30 عملة لكل دفعة) لمعالجة مستقرة وسريعة
+    batches = list(chunk_list(tickers, 30))
+    
+    for batch in batches:
+        try:
+            q = Query().select(
+                'close', 'change', 'volume', 'RSI', 'ADX', 
+                'EMA9', 'EMA21', 'BB.lower', 'BB.upper'
+            )
+            q.set_tickers(*batch)
+            _, data = q.get_scanner_data()
             
-        # تحويل البيانات إلى قاموس JSON متوافق لإرساله عبر الشبكة
-        result = data.to_dict(orient="records")
-        return {"success": True, "data": result}
+            if data is not None and not data.empty:
+                # تحويل البيانات إلى تنسيق بايثون وتصفية قيم NaN/Inf التي تسبب انهيار الـ JSON
+                cleaned_data = data.replace([np.inf, -np.inf], np.nan)
+                # استبدال جميع الـ NaN بـ None لترسل كـ null متوافقة مع JSON
+                cleaned_data = cleaned_data.astype(object).where(pd.notnull(cleaned_data), None)
+                
+                records = cleaned_data.to_dict(orient="records")
+                combined_records.extend(records)
+        except Exception as batch_error:
+            # تخطي الدفعة التي تحتوي على أخطاء دون التسبب في انهيار الفحص بالكامل
+            continue
+            
+    if not combined_records:
+        raise HTTPException(status_code=404, detail="Failed to fetch active data for all batches")
         
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching data: {str(e)}")
+    return {"success": True, "data": combined_records}
 
 if __name__ == "__main__":
-    # تشغيل الخادم محليا أو عبر منفذ الاستضافة
-    import os
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
